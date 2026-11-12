@@ -2,7 +2,7 @@
 //! static credentials are protected together with the current Windows user.
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use std::{collections::{HashMap, HashSet}, fs, io::{Read, Write}, net::IpAddr, path::Path, process::{Command, Stdio}};
+use std::{collections::{HashMap, HashSet}, fs, io::{Read, Write}, path::Path, process::{Command, Stdio}};
 
 const MAX_DOWNLOAD: u64 = 8 * 1024 * 1024;
 
@@ -22,13 +22,23 @@ pub struct StaticNode {
     pub id: String, pub name: String, pub server: String, pub port: u16,
     pub username: String, pub password: String, pub position: Point,
 }
+// A user-supplied outbound node (share link, YAML fragment or SOCKS5 form).
+// `proxy` holds the complete mihomo outbound mapping; `name` mirrors its label.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomNode {
+    pub id: String, pub name: String, pub proxy: Value, pub position: Point,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
-    pub version: u32, pub subscriptions: Vec<Subscription>, pub exits: Vec<StaticNode>, pub links: Vec<Link>,
+    pub version: u32, pub subscriptions: Vec<Subscription>,
+    #[serde(default)] pub customs: Vec<CustomNode>,
+    #[serde(default)] exits: Vec<StaticNode>,   // version-1 layout, migrated on load
+    pub links: Vec<Link>,
 }
 impl Default for Workspace {
-    fn default() -> Self { Self { version: 1, subscriptions: vec![], exits: vec![], links: vec![] } }
+    fn default() -> Self { Self { version: 2, subscriptions: vec![], customs: vec![], exits: vec![], links: vec![] } }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,10 +48,10 @@ pub struct NodeChoice { pub name: String, pub region: Option<String> }
 pub struct SubscriptionView { pub id: String, pub name: String, pub choices: Vec<NodeChoice>, pub selected: Option<String>, pub position: Point }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StaticView { pub id: String, pub name: String, pub position: Point }
+pub struct CustomView { pub id: String, pub name: String, pub protocol: String, pub position: Point }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceView { pub subscriptions: Vec<SubscriptionView>, pub exits: Vec<StaticView>, pub links: Vec<Link> }
+pub struct WorkspaceView { pub subscriptions: Vec<SubscriptionView>, pub customs: Vec<CustomView>, pub links: Vec<Link> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,9 +64,16 @@ pub struct SelectionInput { pub id: String, pub selected: Option<String> }
 pub struct LayoutInput { pub positions: Vec<PositionInput>, pub links: Vec<Link>, pub selections: Vec<SelectionInput> }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StaticInput { pub id: Option<String>, pub name: String, pub server: String, pub port: Option<u16>, pub username: String, pub password: String }
+pub struct CustomInput {
+    pub id: Option<String>, pub name: String,
+    #[serde(default)] pub server: String, pub port: Option<u16>,
+    #[serde(default)] pub username: String, #[serde(default)] pub password: String,
+    // Share link or single-node YAML; when empty the SOCKS5 fields are used.
+    #[serde(default)] pub config: String,
+}
 
-pub struct VisualChain { pub relays: Vec<(String, Value)>, pub exit: StaticNode, pub unused_count: usize }
+// Ordered hops from first dial-in to the chain tail (the egress).
+pub struct VisualChain { pub hops: Vec<(String, Value)>, pub unused_count: usize }
 
 fn valid_name(name: &str) -> bool { !name.trim().is_empty() && name.chars().count() <= 120 && !name.chars().any(char::is_control) }
 fn node_name(node: &Value) -> Option<&str> { node.get("name")?.as_str() }
@@ -84,8 +101,22 @@ fn protect(data: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
 pub fn load(path: &Path) -> Result<Workspace, String> {
     let bytes = match fs::read(path) { Ok(bytes) => bytes, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Workspace::default()), Err(_) => return Err("无法读取已保存的配置".into()) };
     let plain = protect(&bytes, false)?;
-    let workspace: Workspace = serde_json::from_slice(&plain).map_err(|_| "已保存的配置无法解析")?;
-    if workspace.version != 1 { return Err("此版本无法读取该配置".into()); }
+    let mut workspace: Workspace = serde_json::from_slice(&plain).map_err(|_| "已保存的配置无法解析")?;
+    match workspace.version {
+        1 | 2 => {
+            // Version 1 stored dedicated SOCKS5 exits; they are generic custom
+            // nodes now. Migrate silently so the saved canvas keeps working.
+            for exit in std::mem::take(&mut workspace.exits) {
+                let mut proxy = serde_yaml::Mapping::new();
+                for (k, v) in [("name", Value::String(exit.name.clone())), ("type", Value::String("socks5".into())), ("server", Value::String(exit.server)), ("port", Value::Number(exit.port.into())), ("username", Value::String(exit.username)), ("password", Value::String(exit.password)), ("udp", Value::Bool(false))] {
+                    proxy.insert(Value::String(k.into()), v);
+                }
+                workspace.customs.push(CustomNode { id: exit.id, name: exit.name, proxy: Value::Mapping(proxy), position: exit.position });
+            }
+            workspace.version = 2;
+        }
+        _ => return Err("此版本无法读取该配置".into()),
+    }
     Ok(workspace)
 }
 pub fn save(path: &Path, workspace: &Workspace) -> Result<(), String> {
@@ -104,23 +135,28 @@ pub fn view(workspace: &Workspace) -> WorkspaceView {
             id: s.id.clone(), name: s.name.clone(), selected: s.selected.clone(), position: s.position.clone(),
             choices: s.proxies.iter().filter_map(node_name).map(|name| NodeChoice { name: name.into(), region: super::region_from_node_name(name) }).collect(),
         }).collect(),
-        exits: workspace.exits.iter().map(|n| StaticView { id: n.id.clone(), name: n.name.clone(), position: n.position.clone() }).collect(),
+        customs: workspace.customs.iter().map(|n| CustomView {
+            id: n.id.clone(), name: n.name.clone(), position: n.position.clone(),
+            protocol: n.proxy.get("type").and_then(Value::as_str).unwrap_or("?").to_owned(),
+        }).collect(),
         links: workspace.links.clone(),
     }
 }
 
 pub fn parse_subscription(data: &[u8]) -> Result<Vec<Value>, String> {
     if data.len() > MAX_DOWNLOAD as usize { return Err("订阅内容过大".into()) }
-    let doc: Value = serde_yaml::from_slice(data).map_err(|_| "订阅不是有效的 Clash YAML 配置")?;
-    let nodes = doc.get("proxies").and_then(Value::as_sequence).ok_or("订阅中没有可直接使用的 proxies 节点列表")?;
+    let nodes = serde_yaml::from_slice::<Value>(data).ok()
+        .and_then(|doc| doc.get("proxies").and_then(Value::as_sequence).cloned())
+        .or_else(|| super::node_uri::parse_link_list(data).ok())
+        .ok_or("订阅不是有效的 Clash YAML 或节点链接列表")?;
     if nodes.is_empty() || nodes.len() > 2000 { return Err("订阅节点为空或数量过多".into()) }
     let mut seen = HashSet::new();
-    for node in nodes {
+    for node in &nodes {
         let name = node_name(node).ok_or("订阅中有节点缺少名称")?;
         let kind = node.get("type").and_then(Value::as_str).unwrap_or("");
         if !valid_name(name) || kind.is_empty() || !seen.insert(name) { return Err("订阅中存在无效或重复的节点名称".into()) }
     }
-    Ok(nodes.clone())
+    Ok(nodes)
 }
 
 // The URL (which may contain a token) is sent on stdin, never in process args.
@@ -170,48 +206,82 @@ pub fn edit_subscription(workspace: &mut Workspace, id: &str, name: String, url:
     if let Some(proxies) = proxies { replace_subscription(workspace, id, proxies)?; }
     Ok(())
 }
-pub fn put_static(workspace: &mut Workspace, input: StaticInput) -> Result<(), String> {
-    let name = input.name.trim();
-    if !valid_name(name) { return Err("请填写节点名称".into()); }
-    if workspace.exits.iter().any(|x| x.name == name && Some(x.id.as_str()) != input.id.as_deref()) { return Err("静态节点名称已存在".into()); }
+fn socks5_proxy(name: &str, server: &str, port: u16, username: &str, password: &str) -> Result<Value, String> {
+    let server = server.trim();
+    if server.is_empty() || server.len() > 253 || server.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\')) || port == 0 {
+        return Err("请填写有效的服务器地址和端口".into());
+    }
+    match (username.is_empty(), password.is_empty()) {
+        (true, false) | (false, true) => return Err("账号和密码需同时填写或同时留空".into()),
+        _ => (),
+    }
+    let mut m = serde_yaml::Mapping::new();
+    m.insert(Value::String("name".into()), Value::String(name.into()));
+    m.insert(Value::String("type".into()), Value::String("socks5".into()));
+    m.insert(Value::String("server".into()), Value::String(server.into()));
+    m.insert(Value::String("port".into()), Value::Number(port.into()));
+    if !username.is_empty() { m.insert(Value::String("username".into()), Value::String(username.into())); }
+    if !password.is_empty() { m.insert(Value::String("password".into()), Value::String(password.into())); }
+    m.insert(Value::String("udp".into()), Value::Bool(false));
+    Ok(Value::Mapping(m))
+}
+fn proxy_label(proxy: &Value) -> Option<String> { proxy.get("name").and_then(Value::as_str).map(str::to_owned) }
+fn build_proxy(input: &CustomInput, name: &str, pasted: bool) -> Result<Value, String> {
+    let mut proxy = if pasted { super::node_uri::parse_node(&input.config)? }
+        else { socks5_proxy(if name.is_empty() { "节点" } else { name }, &input.server, input.port.ok_or("请填写端口")?, &input.username, &input.password)? };
+    if !name.is_empty() {
+        if let Some(map) = proxy.as_mapping_mut() { map.insert(Value::String("name".into()), Value::String(name.into())); }
+    }
+    Ok(proxy)
+}
+pub fn put_custom(workspace: &mut Workspace, input: CustomInput) -> Result<(), String> {
+    let pasted = !input.config.trim().is_empty();
+    let form = !input.server.trim().is_empty() || input.port.is_some() || !input.username.is_empty() || !input.password.is_empty();
+    if pasted && form { return Err("请在链接和手动表单中二选一".into()); }
+    let name = input.name.trim().to_owned();
+    if !name.is_empty() && !valid_name(&name) { return Err("请填写有效的节点名称".into()); }
     if let Some(id) = input.id.as_deref() {
-        if input.port == Some(0) { return Err("端口必须在 1 至 65535 之间".into()); }
-        let node = workspace.exits.iter_mut().find(|n| n.id == id).ok_or("静态节点已不存在")?;
-        node.name = name.into();
-        if !input.server.trim().is_empty() { node.server = input.server.trim().into(); }
-        if let Some(port) = input.port.filter(|p| *p > 0) { node.port = port; }
-        if !input.username.is_empty() { node.username = input.username; }
-        if !input.password.is_empty() { node.password = input.password; }
-        if node.server.parse::<IpAddr>().is_err() { return Err("静态出口地址必须是有效的 IP".into()) }
+        let node = workspace.customs.iter().find(|n| n.id == id).map(|n| n.name.clone()).ok_or("节点已不存在")?;
+        let proxy = if pasted || form { Some(build_proxy(&input, &name, pasted)?) } else { None };
+        let label = if !name.is_empty() { name } else { proxy.as_ref().and_then(proxy_label).unwrap_or(node) };
+        if !valid_name(&label) { return Err("节点名称无效".into()); }
+        if workspace.customs.iter().any(|x| x.name == label && x.id != id) { return Err("节点名称已存在".into()); }
+        let node = workspace.customs.iter_mut().find(|n| n.id == id).ok_or("节点已不存在")?;
+        node.name = label;
+        if let Some(proxy) = proxy { node.proxy = proxy; }
     } else {
-        if workspace.exits.len() >= 30 { return Err("最多添加 30 个静态出口".into()); }
-        if input.server.trim().parse::<IpAddr>().is_err() || input.port.filter(|p| *p > 0).is_none() || input.username.is_empty() || input.password.is_empty() { return Err("请填写有效的 IP、端口、账号和密码".into()); }
-        let index = workspace.exits.len();
-        workspace.exits.push(StaticNode { id: new_id("exit"), name: name.into(), server: input.server.trim().into(), port: input.port.unwrap(), username: input.username, password: input.password, position: Point { x: 70.0 + workspace.subscriptions.len().clamp(1, 3) as f64 * 270.0, y: 95.0 + index as f64 * 150.0 } });
+        if !pasted && !form { return Err("请粘贴节点链接或填写表单".into()); }
+        if workspace.customs.len() >= 30 { return Err("最多添加 30 个自定义节点".into()); }
+        let proxy = build_proxy(&input, &name, pasted)?;
+        let label = if !name.is_empty() { name } else { proxy_label(&proxy).unwrap_or_else(|| "节点".into()) };
+        if !valid_name(&label) { return Err("节点名称无效".into()); }
+        if workspace.customs.iter().any(|x| x.name == label) { return Err("节点名称已存在".into()); }
+        let index = workspace.customs.len();
+        workspace.customs.push(CustomNode { id: new_id("node"), name: label, proxy, position: Point { x: 70.0 + workspace.subscriptions.len().clamp(1, 3) as f64 * 270.0, y: 95.0 + index as f64 * 150.0 } });
     }
     Ok(())
 }
 pub fn remove(workspace: &mut Workspace, id: &str) -> Result<(), String> {
-    let before = workspace.subscriptions.len() + workspace.exits.len();
+    let before = workspace.subscriptions.len() + workspace.customs.len();
     workspace.subscriptions.retain(|s| s.id != id);
-    workspace.exits.retain(|s| s.id != id);
-    if before == workspace.subscriptions.len() + workspace.exits.len() { return Err("节点已不存在".into()); }
+    workspace.customs.retain(|s| s.id != id);
+    if before == workspace.subscriptions.len() + workspace.customs.len() { return Err("节点已不存在".into()); }
     workspace.links.retain(|link| link.source != id && link.target != id);
     Ok(())
 }
 
 pub fn save_layout(workspace: &mut Workspace, input: LayoutInput) -> Result<(), String> {
     let vpn: HashSet<&str> = workspace.subscriptions.iter().map(|s| s.id.as_str()).collect();
-    let exits: HashSet<&str> = workspace.exits.iter().map(|s| s.id.as_str()).collect();
-    let all: HashSet<&str> = vpn.union(&exits).copied().collect();
+    let customs: HashSet<&str> = workspace.customs.iter().map(|s| s.id.as_str()).collect();
+    let all: HashSet<&str> = vpn.union(&customs).copied().collect();
     let mut sources = HashSet::new(); let mut targets = HashSet::new();
     for link in &input.links {
-        if !vpn.contains(link.source.as_str()) || !all.contains(link.target.as_str()) || link.source == link.target || !sources.insert(link.source.as_str()) || !targets.insert(link.target.as_str()) {
-            return Err("每个节点只能有一条上游和下游，静态出口只能作为终点".into());
+        if !all.contains(link.source.as_str()) || !all.contains(link.target.as_str()) || link.source == link.target || !sources.insert(link.source.as_str()) || !targets.insert(link.target.as_str()) {
+            return Err("每个节点只能有一条上游和下游".into());
         }
     }
     let outgoing: HashMap<&str, &str> = input.links.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
-    for &start in &vpn {
+    for &start in &all {
         let mut seen = HashSet::new(); let mut current = start;
         while let Some(next) = outgoing.get(current) {
             if !seen.insert(current) { return Err("链路不能形成循环".into()); }
@@ -230,7 +300,7 @@ pub fn save_layout(workspace: &mut Workspace, input: LayoutInput) -> Result<(), 
     }
     for item in input.positions {
         if let Some(sub) = workspace.subscriptions.iter_mut().find(|s| s.id == item.id) { sub.position = item.position; }
-        else if let Some(node) = workspace.exits.iter_mut().find(|n| n.id == item.id) { node.position = item.position; }
+        else if let Some(node) = workspace.customs.iter_mut().find(|n| n.id == item.id) { node.position = item.position; }
     }
     for item in input.selections { if let Some(sub) = workspace.subscriptions.iter_mut().find(|s| s.id == item.id) { sub.selected = item.selected; } }
     workspace.links = input.links;
@@ -238,23 +308,41 @@ pub fn save_layout(workspace: &mut Workspace, input: LayoutInput) -> Result<(), 
 }
 
 pub fn chain(workspace: &Workspace) -> Result<VisualChain, String> {
-    let connected_exits: Vec<&StaticNode> = workspace.exits.iter().filter(|exit| workspace.links.iter().any(|e| e.target == exit.id)).collect();
-    if connected_exits.len() != 1 { return Err("请连接一条以静态 IP 为终点的链路".into()) }
-    let exit = connected_exits[0].clone();
-    let incoming: HashMap<&str, &str> = workspace.links.iter().map(|e| (e.target.as_str(), e.source.as_str())).collect();
-    let mut next = exit.id.as_str(); let mut seen = HashSet::new(); let mut reverse = Vec::new();
-    while let Some(source) = incoming.get(next) {
-        if !seen.insert(*source) { return Err("链路不能形成循环".into()) }
-        let sub = workspace.subscriptions.iter().find(|s| s.id == *source).ok_or("链路包含不存在的订阅")?;
-        let selected = sub.selected.as_deref().ok_or("请选择每个订阅的节点")?;
-        let proxy = sub.proxies.iter().find(|p| node_name(p) == Some(selected)).cloned().ok_or("订阅节点已不存在，请重新选择")?;
-        reverse.push((format!("{} · {}", sub.name, selected), proxy));
-        next = source;
+    // One linear path: a unique head (outgoing only) through to the tail
+    // (incoming only). The tail is the egress; any node kind may hold it.
+    let linked: HashSet<&str> = workspace.links.iter().flat_map(|e| [e.source.as_str(), e.target.as_str()]).collect();
+    let mut order: Vec<&str> = Vec::new();
+    if linked.is_empty() {
+        let only = workspace.subscriptions.iter().map(|s| s.id.as_str()).chain(workspace.customs.iter().map(|c| c.id.as_str())).collect::<Vec<_>>();
+        if only.len() != 1 { return Err("请把节点连成一个链，或只留一个节点".into()) }
+        order.push(only[0]);
+    } else {
+        let incoming: HashSet<&str> = workspace.links.iter().map(|e| e.target.as_str()).collect();
+        let heads: Vec<&&str> = linked.iter().filter(|id| !incoming.contains(**id)).collect();
+        if heads.len() != 1 { return Err("链路需要唯一的起点".into()) }
+        let outgoing: HashMap<&str, &str> = workspace.links.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        let mut current = *heads[0];
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current) { return Err("链路不能形成循环".into()) }
+            order.push(current);
+            match outgoing.get(current) { Some(next) => current = next, None => break }
+        }
+        if order.len() != linked.len() { return Err("只能连接一条链路，其余节点未加入".into()) }
     }
-    if reverse.is_empty() || reverse.len() > 4 { return Err("链路需要 1 至 4 个 VPN 中继".into()) }
-    reverse.reverse();
-    let unused_count = workspace.subscriptions.len() + workspace.exits.len() - reverse.len() - 1;
-    Ok(VisualChain { relays: reverse, exit, unused_count })
+    if order.is_empty() || order.len() > 6 { return Err("链路需要 1 至 6 跳".into()) }
+    let mut hops = Vec::new();
+    for id in order {
+        if let Some(sub) = workspace.subscriptions.iter().find(|s| s.id == id) {
+            let selected = sub.selected.as_deref().ok_or("请选择每个订阅的节点")?;
+            let proxy = sub.proxies.iter().find(|p| node_name(p) == Some(selected)).cloned().ok_or("订阅节点已不存在，请重新选择")?;
+            hops.push((format!("{} · {}", sub.name, selected), proxy));
+        } else if let Some(node) = workspace.customs.iter().find(|c| c.id == id) {
+            hops.push((node.name.clone(), node.proxy.clone()));
+        } else { return Err("链路包含不存在的节点".into()) }
+    }
+    let unused_count = workspace.subscriptions.len() + workspace.customs.len() - hops.len();
+    Ok(VisualChain { hops, unused_count })
 }
 
 #[cfg(test)]
@@ -264,8 +352,8 @@ mod tests {
     fn sample() -> Workspace {
         let mut w = Workspace::default();
         put_subscription(&mut w, "机场".into(), "https://example.com/sub?token=private-url".into(), parse_subscription(YAML.as_bytes()).unwrap()).unwrap();
-        put_static(&mut w, StaticInput { id: None, name: "出口".into(), server: "192.0.2.8".into(), port: Some(1080), username: "private-user".into(), password: "private-pass".into() }).unwrap();
-        w.links.push(Link { source: w.subscriptions[0].id.clone(), target: w.exits[0].id.clone() });
+        put_custom(&mut w, CustomInput { id: None, name: "出口".into(), server: "192.0.2.8".into(), port: Some(1080), username: "private-user".into(), password: "private-pass".into(), config: String::new() }).unwrap();
+        w.links.push(Link { source: w.subscriptions[0].id.clone(), target: w.customs[0].id.clone() });
         w
     }
     #[test]
@@ -278,7 +366,43 @@ mod tests {
         let loaded = load(&path).unwrap();
         let view = serde_json::to_string(&view(&loaded)).unwrap();
         assert!(!view.contains("private-"));
-        assert_eq!(chain(&loaded).unwrap().relays.len(), 1);
+        assert_eq!(chain(&loaded).unwrap().hops.len(), 2);
+    }
+    #[test]
+    fn version_one_exits_migrate_into_custom_nodes() {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = temp.path().join("workspace.dat");
+        let mut w = Workspace::default();
+        w.version = 1;
+        w.customs.clear();
+        w.exits.push(StaticNode { id: "exit-legacy".into(), name: "旧出口".into(), server: "192.0.2.9".into(), port: 1080, username: "u".into(), password: "private-pass".into(), position: Point { x: 1.0, y: 2.0 } });
+        save(&path, &w).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.customs.len(), 1);
+        assert_eq!(loaded.customs[0].proxy.get("type").and_then(Value::as_str), Some("socks5"));
+        assert_eq!(loaded.customs[0].proxy.get("server").and_then(Value::as_str), Some("192.0.2.9"));
+    }
+    #[test]
+    fn chain_accepts_any_node_order_and_rejects_extra_chains() {
+        let mut w = Workspace::default();
+        put_custom(&mut w, CustomInput { id: None, name: "VPS".into(), config: "ss://YWVzLTI1Ni1nY206cEB2cHMuZXhhbXBsZTo0NDM=".into(), server: String::new(), port: None, username: String::new(), password: String::new() }).unwrap();
+        put_custom(&mut w, CustomInput { id: None, name: "出口".into(), server: "192.0.2.8".into(), port: Some(1080), username: String::new(), password: String::new(), config: String::new() }).unwrap();
+        put_custom(&mut w, CustomInput { id: None, name: "游离".into(), server: "192.0.2.7".into(), port: Some(1080), username: String::new(), password: String::new(), config: String::new() }).unwrap();
+        w.links.push(Link { source: w.customs[0].id.clone(), target: w.customs[1].id.clone() });
+        assert_eq!(chain(&w).unwrap().hops.len(), 2);
+        assert_eq!(chain(&w).unwrap().unused_count, 1);
+        w.links.push(Link { source: w.customs[2].id.clone(), target: w.customs[0].id.clone() });
+        assert_eq!(chain(&w).unwrap().hops.len(), 3);
+        assert!(chain(&w).is_ok());
+    }
+    #[test]
+    fn single_unlinked_node_is_a_valid_chain() {
+        let mut w = Workspace::default();
+        put_custom(&mut w, CustomInput { id: None, name: "VPS".into(), server: "vps.example".into(), port: Some(443), username: String::new(), password: String::new(), config: String::new() }).unwrap();
+        let c = chain(&w).unwrap();
+        assert_eq!(c.hops.len(), 1);
+        assert_eq!(c.hops[0].0, "VPS");
     }
     #[test]
     fn rejects_invalid_and_duplicate_subscriptions() {
@@ -291,7 +415,7 @@ mod tests {
         put_subscription(&mut w, "另一机场".into(), "https://example.com".into(), parse_subscription(YAML.as_bytes()).unwrap()).unwrap();
         assert_eq!(chain(&w).unwrap().unused_count, 1);
         let a = w.subscriptions[0].id.clone(); let b = w.subscriptions[1].id.clone();
-        let positions = w.subscriptions.iter().map(|n| PositionInput { id: n.id.clone(), position: n.position.clone() }).chain(w.exits.iter().map(|n| PositionInput { id: n.id.clone(), position: n.position.clone() })).collect();
+        let positions = w.subscriptions.iter().map(|n| PositionInput { id: n.id.clone(), position: n.position.clone() }).chain(w.customs.iter().map(|n| PositionInput { id: n.id.clone(), position: n.position.clone() })).collect();
         let selections = w.subscriptions.iter().map(|n| SelectionInput { id: n.id.clone(), selected: n.selected.clone() }).collect();
         assert!(save_layout(&mut w, LayoutInput { positions, selections, links: vec![Link { source: a.clone(), target: b.clone() }, Link { source: b, target: a }] }).is_err());
     }

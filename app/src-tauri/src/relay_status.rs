@@ -105,7 +105,7 @@ fn resolve_saved(runtime: &Yaml, profile: &Yaml, group: &str) -> Option<(String,
 }
 
 // Only accept a local Windows named pipe specified by the runtime configuration.
-fn local_pipe(runtime: &Yaml) -> Option<String> {
+pub(crate) fn local_pipe(runtime: &Yaml) -> Option<String> {
     let value = super::field(runtime, "external-controller-pipe")?.as_str()?.trim();
     let prefix = r"\\.\pipe\";
     if value.len() <= prefix.len() || !value.get(..prefix.len())?.eq_ignore_ascii_case(prefix) { return None; }
@@ -113,7 +113,7 @@ fn local_pipe(runtime: &Yaml) -> Option<String> {
     if name.len() > 180 || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')) { return None; }
     Some(value.to_owned())
 }
-fn loopback_controller(runtime: &Yaml) -> Option<(SocketAddr, Option<String>)> {
+pub(crate) fn loopback_controller(runtime: &Yaml) -> Option<(SocketAddr, Option<String>)> {
     let value = super::field(runtime, "external-controller")?.as_str()?.trim();
     let address = if let Some(port) = value.strip_prefix("localhost:") {
         SocketAddr::from((Ipv4Addr::LOCALHOST, port.parse::<u16>().ok()?))

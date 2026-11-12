@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod configure;
+mod node_uri;
 mod relay_status;
+mod verge_activate;
 mod workspace;
 
 use serde::Serialize;
@@ -140,18 +142,22 @@ fn parse_config(choice: &str, client: &str, raw: &str, sys: (bool, Option<u16>))
     let groups = seq(field(&doc, "proxy-groups"));
     let proxies = seq(field(&doc, "proxies"));
     let group = groups.iter().find(|g| text(field(g, "name")) == result.route_target);
-    let is_chained_socks = |p: &&Value| field(p, "dialer-proxy").is_some() && field(p, "type").and_then(Value::as_str).map(|kind| kind.eq_ignore_ascii_case("socks5")).unwrap_or(false);
+    let is_chained = |p: &&Value| field(p, "dialer-proxy").is_some();
     let selected_candidate = group.and_then(|g| seq(field(g, "proxies")).iter().filter_map(Value::as_str).find_map(|name| {
-        proxies.iter().filter(is_chained_socks).find(|p| field(p, "name").and_then(Value::as_str) == Some(name))
-    })).or_else(|| result.route_target.as_deref().and_then(|target| proxies.iter().filter(is_chained_socks).find(|p| field(p, "name").and_then(Value::as_str) == Some(target))));
-    // The known setup uses LS-ISP-01. This is a node label only, never an ISP address or credential.
-    let static_proxy = selected_candidate.or_else(|| proxies.iter().find(|p| field(p, "name").and_then(Value::as_str) == Some("LS-ISP-01")));
+        proxies.iter().filter(is_chained).find(|p| field(p, "name").and_then(Value::as_str) == Some(name))
+    })).or_else(|| result.route_target.as_deref().and_then(|target| proxies.iter().filter(is_chained).find(|p| field(p, "name").and_then(Value::as_str) == Some(target))));
+    // Fall back to the chain tail among HopWay-managed nodes when neither the
+    // default rule nor a group reveals it.
+    let managed_tail = || proxies.iter().filter(is_chained)
+        .filter(|p| field(p, "name").and_then(Value::as_str).map(|n| n.starts_with("__hopway_")).unwrap_or(false))
+        .find(|p| { let name = field(p, "name").and_then(Value::as_str); !proxies.iter().any(|q| field(q, "dialer-proxy").and_then(Value::as_str) == name) });
+    let static_proxy = selected_candidate.or_else(managed_tail);
     if let Some(proxy) = static_proxy {
         let in_static_group = group.map(|g| seq(field(g, "proxies")).iter().any(|item|
             item.as_str() == field(proxy, "name").and_then(Value::as_str))).unwrap_or(false);
-        let is_static_socks = field(proxy, "type").and_then(Value::as_str).map(|kind| kind.eq_ignore_ascii_case("socks5")).unwrap_or(false);
-        result.chain_attached = is_static_socks && (in_static_group || result.route_target.as_deref() == field(proxy, "name").and_then(Value::as_str));
-        if result.route_target.as_deref() == Some("静态ISP") && in_static_group && is_static_socks {
+        let is_leaf_proxy = field(proxy, "type").and_then(Value::as_str).map(|kind| !kind.is_empty()).unwrap_or(false);
+        result.chain_attached = is_leaf_proxy && (in_static_group || result.route_target.as_deref() == field(proxy, "name").and_then(Value::as_str));
+        if matches!(result.route_target.as_deref(), Some(configure::STATIC_GROUP) | Some(configure::LEGACY_GROUP)) && in_static_group && is_leaf_proxy {
             result.expected_ip = field(proxy, "server").and_then(Value::as_str).and_then(|server| server.parse().ok());
         }
         let display_name = |name: &str| {
@@ -435,11 +441,11 @@ async fn edit_subscription(app: tauri::AppHandle, id: String, name: String, url:
     Ok(workspace::view(&project))
 }
 #[tauri::command]
-fn save_static_node(app: tauri::AppHandle, state: State<'_, WorkspaceState>, input: workspace::StaticInput) -> Result<workspace::WorkspaceView, String> {
-    let _lock = state.0.lock().map_err(|_| "无法保存静态节点")?;
+fn save_custom_node(app: tauri::AppHandle, state: State<'_, WorkspaceState>, input: workspace::CustomInput) -> Result<workspace::WorkspaceView, String> {
+    let _lock = state.0.lock().map_err(|_| "无法保存节点")?;
     let path = workspace_path(&app)?;
     let mut project = workspace::load(&path)?;
-    workspace::put_static(&mut project, input)?;
+    workspace::put_custom(&mut project, input)?;
     workspace::save(&path, &project)?;
     let _ = app.emit("hopway:workspace-changed", ());
     Ok(workspace::view(&project))
@@ -499,34 +505,36 @@ fn routes_use_static(doc: &Value) -> bool {
         let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
         if parts.len() < 2 { return false; }
         if parts[0].eq_ignore_ascii_case("MATCH") || parts[0].eq_ignore_ascii_case("FINAL") {
-            found_default = parts[1] == "静态ISP";
+            found_default = parts[1] == configure::STATIC_GROUP || parts[1] == configure::LEGACY_GROUP;
             break;
         }
         let mut idx = parts.len() - 1;
         if parts[idx].eq_ignore_ascii_case("no-resolve") && idx > 0 { idx -= 1; }
-        if !["DIRECT", "REJECT", "REJECT-DROP", "PASS", "静态ISP"].contains(&parts[idx]) { return false; }
+        if ![configure::STATIC_GROUP, configure::LEGACY_GROUP, "DIRECT", "REJECT", "REJECT-DROP", "PASS"].contains(&parts[idx]) { return false; }
     }
     found_default
 }
 #[tauri::command]
-async fn verify_visual_live(target: String, exit_node: String, expected_ip: String) -> Result<LiveCheck, String> {
+async fn verify_visual_live(target: String, exit_node: String, expected_ip: Option<String>) -> Result<LiveCheck, String> {
     if target != "verge" || !exit_node.starts_with("__hopway_") { return Err("校验参数无效".into()); }
-    let expected = expected_ip.parse::<IpAddr>().map_err(|_| "静态出口 IP 无效")?;
+    let expected = expected_ip.filter(|v| !v.trim().is_empty()).map(|v| v.parse::<IpAddr>().map_err(|_| "出口 IP 无效".to_string())).transpose()?;
     tauri::async_runtime::spawn_blocking(move || {
         let raw = fs::read_to_string(config_path()).map_err(|_| "无法读取客户端运行配置")?;
         let doc: Value = serde_yaml::from_str(&raw).map_err(|_| "客户端运行配置无效")?;
-        let group = seq(field(&doc, "proxy-groups")).iter().find(|g| field(g, "name").and_then(Value::as_str) == Some("静态ISP"));
+        let group = seq(field(&doc, "proxy-groups")).iter().find(|g| matches!(field(g, "name").and_then(Value::as_str), Some(configure::STATIC_GROUP) | Some(configure::LEGACY_GROUP)));
         let present = group.map(|g| seq(field(g, "proxies")).iter().any(|v| v.as_str() == Some(exit_node.as_str()))).unwrap_or(false)
             && seq(field(&doc, "proxies")).iter().any(|p| field(p, "name").and_then(Value::as_str) == Some(exit_node.as_str()));
         if !present { return Ok(LiveCheck { state: "waiting".into(), ip: None, message: "等待客户端重新应用配置".into() }); }
         let port = field(&doc, "mixed-port").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok()).filter(|v| *v > 0).ok_or("未找到客户端本地代理端口")?;
         let Some(ip) = get_ip(port) else { return Ok(LiveCheck { state: "failed".into(), ip: None, message: "客户端出口探测失败".into() }) };
-        let matches = ip.parse::<IpAddr>().ok() == Some(expected);
         let routes_ok = routes_use_static(&doc);
-        Ok(LiveCheck {
-            state: if matches && routes_ok { "ok" } else if matches { "partial" } else { "mismatch" }.into(), ip: Some(ip),
-            message: if matches && routes_ok { "客户端出口与静态 IP 一致" } else if matches { "探测 IP 一致，但部分规则或模式未指向静态出口" } else { "客户端出口与静态 IP 不一致，请检查策略组选择" }.into(),
-        })
+        let (state, message) = match expected.map(|expected| ip.parse::<IpAddr>().ok() == Some(expected)) {
+            Some(true) if routes_ok => ("ok", "客户端出口与链路一致".to_string()),
+            Some(true) => ("partial", "出口可达，但部分规则或模式未指向链路组".to_string()),
+            Some(false) => ("mismatch", "客户端出口与期望 IP 不一致，请检查策略组选择".to_string()),
+            None => ("partial", "出口为域名节点，无法按 IP 比对；请确认 HopWay 组选中链尾".to_string()),
+        };
+        Ok(LiveCheck { state: state.into(), ip: Some(ip), message })
     }).await.map_err(|_| "客户端出口校验失败")?
 }
 
@@ -604,7 +612,7 @@ fn main() {
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); let _ = window.hide(); }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, get_relay_selections, probe_egress, show_main, show_widget, hide_widget, hide_main, minimize_main, set_widget_expanded, toggle_maximize_main, chain_options, prepare_chain, apply_chain, cancel_chain, load_workspace, add_subscription, edit_subscription, refresh_subscription, save_static_node, remove_workspace_node, save_workspace_layout, prepare_visual_chain, verify_visual_live])
+        .invoke_handler(tauri::generate_handler![get_snapshot, get_relay_selections, probe_egress, show_main, show_widget, hide_widget, hide_main, minimize_main, set_widget_expanded, toggle_maximize_main, chain_options, prepare_chain, apply_chain, cancel_chain, load_workspace, add_subscription, edit_subscription, refresh_subscription, save_custom_node, remove_workspace_node, save_workspace_layout, prepare_visual_chain, verify_visual_live])
         .run(tauri::generate_context!())
         .expect("HopWay failed to start");
 }
@@ -614,11 +622,11 @@ mod tests {
     use super::*;
     #[test]
     fn extracts_chain_without_secrets_and_does_not_infer_selected_node() {
-        let config = "mixed-port: 7890\nproxies:\n  - name: LS-ISP-01\n    type: socks5\n    server: private.example\n    password: secret-value\n    dialer-proxy: Relay\nproxy-groups:\n  - name: Relay\n    type: select\n    proxies: [A, B]\n  - name: Static\n    type: select\n    proxies: [LS-ISP-01, DIRECT]\nrules: ['MATCH,Static']\n";
+        let config = "mixed-port: 7890\nproxies:\n  - name: ExitNode\n    type: socks5\n    server: private.example\n    password: secret-value\n    dialer-proxy: Relay\nproxy-groups:\n  - name: Relay\n    type: select\n    proxies: [A, B]\n  - name: Static\n    type: select\n    proxies: [ExitNode, DIRECT]\nrules: ['MATCH,Static']\n";
         let s = parse_config("verge", "verge", config, (true, Some(7890)));
         assert_eq!(s.relay.as_deref(), Some("Relay"));
         assert_eq!(s.relay_kind.as_deref(), Some("策略组"));
-        assert_eq!(s.static_node.as_deref(), Some("LS-ISP-01"));
+        assert_eq!(s.static_node.as_deref(), Some("ExitNode"));
         assert_eq!(s.route_target.as_deref(), Some("Static"));
         assert!(s.system_proxy_matches);
     }
@@ -638,14 +646,14 @@ mod tests {
     }
     #[test]
     fn direct_relay_flag_requires_a_configured_proxy() {
-        let prefix = "mixed-port: 7890\nproxies:\n - name: LS-ISP-01\n   dialer-proxy: '🇭🇰香港01'\n";
+        let prefix = "mixed-port: 7890\nproxies:\n - name: '__hopway_x1_exit::ExitNode'\n   dialer-proxy: '🇭🇰香港01'\n";
         let valid = format!("{prefix} - name: '🇭🇰香港01'\n");
         assert_eq!(parse_config("auto", "verge", &valid, (false, None)).relay_region.as_deref(), Some("hk"));
         assert_eq!(parse_config("auto", "verge", prefix, (false, None)).relay_region, None);
     }
     #[test]
     fn displays_each_managed_relay_in_order_without_private_fields() {
-        let config = "proxies:\n - name: '__hopway_ab_r1::日本 JP'\n   dialer-proxy: '🇭🇰香港'\n   server: private.example\n - name: '🇭🇰香港'\n - name: '__hopway_ab_exit::出口'\n   type: socks5\n   dialer-proxy: '__hopway_ab_r1::日本 JP'\nproxy-groups:\n - name: 静态ISP\n   type: select\n   proxies: ['__hopway_ab_exit::出口']\nrules: ['MATCH,静态ISP']\n";
+        let config = "proxies:\n - name: '__hopway_ab_r1::日本 JP'\n   dialer-proxy: '🇭🇰香港'\n   server: private.example\n - name: '🇭🇰香港'\n - name: '__hopway_ab_exit::出口'\n   type: socks5\n   dialer-proxy: '__hopway_ab_r1::日本 JP'\nproxy-groups:\n - name: HopWay\n   type: select\n   proxies: ['__hopway_ab_exit::出口']\nrules: ['MATCH,HopWay']\n";
         let snapshot = parse_config("verge", "verge", config, (false, None));
         assert_eq!(snapshot.relays.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["🇭🇰香港", "日本 JP"]);
         assert_eq!(snapshot.relays[0].region.as_deref(), Some("hk"));
@@ -655,9 +663,9 @@ mod tests {
     }
     #[test]
     fn live_check_requires_all_proxy_rules_and_default_to_use_static() {
-        let good: Value = serde_yaml::from_str("mode: rule\nrules: ['DOMAIN,a,DIRECT', 'PROCESS-NAME,x,静态ISP', 'MATCH,静态ISP']\n").unwrap();
-        let bad: Value = serde_yaml::from_str("mode: rule\nrules: ['DOMAIN,a,Airport', 'MATCH,静态ISP']\n").unwrap();
-        let global: Value = serde_yaml::from_str("mode: global\nrules: ['MATCH,静态ISP']\n").unwrap();
+        let good: Value = serde_yaml::from_str("mode: rule\nrules: ['DOMAIN,a,DIRECT', 'PROCESS-NAME,x,HopWay', 'MATCH,HopWay']\n").unwrap();
+        let bad: Value = serde_yaml::from_str("mode: rule\nrules: ['DOMAIN,a,Airport', 'MATCH,HopWay']\n").unwrap();
+        let global: Value = serde_yaml::from_str("mode: global\nrules: ['MATCH,HopWay']\n").unwrap();
         assert!(routes_use_static(&good));
         assert!(!routes_use_static(&bad));
         assert!(!routes_use_static(&global));

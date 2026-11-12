@@ -80,7 +80,7 @@ try {
     }
     $m = [regex]::Match($rt, '(?m)^- MATCH,(\S+)\s*$')
     if ($m.Success) { $facts.Add("MATCH: " + $m.Groups[1].Value) }
-    foreach ($n in 'LS-ISP-01', '静态ISP') {
+    foreach ($n in 'HopWay', '静态ISP') {
         if ($rt -match ('name:\s*"?' + [regex]::Escape($n) + '"?\s*$')) { $facts.Add("存在: $n") }
     }
 } catch {}

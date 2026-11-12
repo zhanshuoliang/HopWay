@@ -16,8 +16,8 @@ document.body.dataset.view = widgetView ? "widget" : "main";
 
 const demo = {
   client: "verge", configFound: true, proxyPort: 7897,
-  systemProxyEnabled: true, systemProxyMatches: true, routeTarget: "静态ISP",
-  staticNode: "静态 IP", chainAttached: true, relay: "香港节点 01", relayKind: "节点",
+  systemProxyEnabled: true, systemProxyMatches: true, routeTarget: "HopWay",
+  staticNode: "自建 VPS", chainAttached: true, relay: "香港节点 01", relayKind: "节点",
   relayRegion: "hk", relayRegionSource: "configured",
   relays: [{ name: "香港节点 01", kind: "节点", region: "hk", regionSource: "configured", protocol: "VMess" }, { name: "新加坡节点 02", kind: "节点", region: "sg", regionSource: "configured", protocol: "VMess" }],
   ip: "203.0.113.8", probeState: "ok", egressMatch: true, updatedAt: Math.floor(Date.now() / 1000),
@@ -109,9 +109,11 @@ function minimizeMain() { if (native) invoke("minimize_main"); }
 // A saved canvas selection is useful as a label, but it is not proof of the
 // currently selected proxy inside Clash Verge.
 function workspaceRelay(workspace) {
-  const exits = (workspace?.exits || []).filter((exit) => workspace.links.some((link) => link.target === exit.id));
-  if (exits.length !== 1) return null;
-  const incoming = workspace.links.find((link) => link.target === exits[0].id);
+  const links = workspace?.links || [];
+  const nodes = [...(workspace?.subscriptions || []), ...(workspace?.customs || [])];
+  const tails = nodes.filter((node) => links.some((link) => link.target === node.id) && !links.some((link) => link.source === node.id));
+  if (tails.length !== 1) return null;
+  const incoming = links.find((link) => link.target === tails[0].id);
   const relay = (workspace.subscriptions || []).find((sub) => sub.id === incoming?.source);
   const choice = relay?.choices?.find((item) => item.name === relay.selected);
   return choice?.region ? { region: choice.region, name: choice.name, source: "workspace" } : null;
@@ -276,7 +278,9 @@ function Dashboard({ state }) {
     try { setMaximized(await invoke("toggle_maximize_main")); } catch { /* Preserve current window state. */ }
   }
   function handleApplied(result) {
-    setLive({ state: "waiting", message: "等待 Clash Verge 重启内核" });
+    setLive(result?.activation?.state === "ok"
+      ? { state: "ok", message: result.nextStep || "链路已生效" }
+      : { state: "waiting", message: result?.nextStep || "等待客户端确认链路" });
     setLastApplied(result);
   }
   function retryLive() {

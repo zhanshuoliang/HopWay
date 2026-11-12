@@ -5,7 +5,8 @@ use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, env, fs, io::Write, path::{Component, Path, PathBuf}, process::{Command, Stdio}, time::{Duration, Instant}};
 
-const STATIC_GROUP: &str = "静态ISP";
+pub(crate) const STATIC_GROUP: &str = "HopWay";
+pub(crate) const LEGACY_GROUP: &str = "静态ISP";
 const SYNC_SCRIPT: &str = include_str!("../../../toolkit/sync-proxy.ps1");
 const STAGE_SCRIPT: &str = include_str!("../../../toolkit/hopway-stage.ps1");
 const WRAPPER_BEGIN: &str = "// BEGIN HOPWAY MANAGED CHAIN";
@@ -66,23 +67,26 @@ struct Change { path: PathBuf, bytes: Vec<u8>, existed: bool }
 pub struct Prepared {
     id: String,
     target: String,
+    root: PathBuf,
     exit_node: String,
     guards: Vec<Guard>,
     changes: Vec<Change>,
     probe: Option<ProbePlan>,
 }
-struct ProbePlan { nodes: Vec<Value>, expected_ip: String }
+struct ProbePlan { nodes: Vec<Value>, expected_ip: Option<String> }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProbeResult { pub state: String, pub ip: Option<String>, pub expected_ip: String, pub message: String }
+pub struct ProbeResult { pub state: String, pub ip: Option<String>, pub expected_ip: Option<String>, pub message: String }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyResult {
     pub target: String,
     pub exit_node: String,
+    pub group: String,
     pub backups: Vec<String>,
     pub next_step: String,
     pub probe: Option<ProbeResult>,
+    pub activation: Option<super::verge_activate::Activation>,
 }
 
 fn key(k: &str) -> Value { Value::String(k.to_owned()) }
@@ -149,7 +153,7 @@ fn editor_options_from(target: &str, root: &Path) -> Result<EditorOptions, Strin
     let mut exits = Vec::new();
     for group in list(get(&doc, "proxy-groups")) {
         let Some(name) = str_field(group, "name") else { continue };
-        if name == STATIC_GROUP { continue; }
+        if name == STATIC_GROUP || name == LEGACY_GROUP { continue; }
         let kind = str_field(group, "type").unwrap_or("");
         if !["select", "url-test", "fallback", "load-balance"].contains(&kind) { continue; }
         relays.push(Choice { name: name.into(), label: name.into(), kind: "策略组".into(), region: None });
@@ -171,8 +175,7 @@ fn editor_options_from(target: &str, root: &Path) -> Result<EditorOptions, Strin
     let default_exit = target_name.and_then(|group_name| named(&doc, "proxy-groups", group_name))
         .and_then(|group| list(get(group, "proxies")).iter().filter_map(Value::as_str)
             .find(|name| exits.iter().any(|item| item.name == *name)))
-        .map(str::to_owned)
-        .or_else(|| exits.iter().find(|n| n.name == "LS-ISP-01").map(|n| n.name.clone()));
+        .map(str::to_owned);
     let mut first = default_exit.as_deref().and_then(|name| named(&doc, "proxies", name))
         .and_then(|n| str_field(n, "dialer-proxy"));
     let mut default_extras = Vec::new();
@@ -290,6 +293,17 @@ fn add_nodes(doc: &mut Value, nodes: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+// Remove stale HopWay-managed proxies and the retired group name before the
+// new chain is merged into the candidate runtime configuration.
+fn prune_stale(doc: &mut Value) -> Result<(), String> {
+    if let Some(list) = mapping(doc)?.get_mut(key("proxies")).and_then(Value::as_sequence_mut) {
+        list.retain(|p| str_field(p, "name").map(|n| !managed(n)).unwrap_or(true));
+    }
+    if let Some(groups) = mapping(doc)?.get_mut(key("proxy-groups")).and_then(Value::as_sequence_mut) {
+        groups.retain(|g| str_field(g, "name") != Some(LEGACY_GROUP));
+    }
+    Ok(())
+}
 fn set_static_group(doc: &mut Value, exit_name: &str) -> Result<(), String> {
     let groups = ensure_list(doc, "proxy-groups")?;
     let pos = groups.iter().position(|g| str_field(g, "name") == Some(STATIC_GROUP));
@@ -393,7 +407,7 @@ fn run_stage(root: &Path, action: &str, proxy_name: &str) -> Result<(), String> 
 }
 
 struct Layer { kind: &'static str, path: PathBuf, stage: PathBuf, original: Option<Vec<u8>> }
-fn verge_layers(root: &Path, stage: &Path, guards: &mut Vec<Guard>) -> Result<(Vec<Layer>, Option<Change>), String> {
+fn verge_layers(root: &Path, stage: &Path, guards: &mut Vec<Guard>, selection: Option<(&str, &str)>) -> Result<(Vec<Layer>, Option<Change>), String> {
     let index_path = root.join("profiles.yaml");
     let index_bytes = read(&index_path)?;
     guard(guards, &index_path, Some(&index_bytes));
@@ -446,6 +460,21 @@ fn verge_layers(root: &Path, stage: &Path, guards: &mut Vec<Guard>) -> Result<(V
             write_stage(&stage.join("verge").join("profiles").join(file), &bytes)?;
         }
     }
+    // Persist the applied selection so a later client restart restores our
+    // tail instead of the previous group member.
+    if let Some((group, node)) = selection {
+        let items = mapping(&mut index)?.get_mut(key("items")).and_then(Value::as_sequence_mut).ok_or("订阅列表格式无效")?;
+        let item = mapping(&mut items[current_idx])?;
+        let entry = item.entry(key("selected")).or_insert_with(|| Value::Sequence(Vec::new()));
+        if entry.is_null() { *entry = Value::Sequence(Vec::new()); }
+        let selected = entry.as_sequence_mut().ok_or("订阅选择记录格式无效")?;
+        selected.retain(|v| { let n = str_field(v, "name"); n != Some(group) && n != Some(LEGACY_GROUP) });
+        let mut sel = Mapping::new();
+        sel.insert(key("name"), Value::String(group.into()));
+        sel.insert(key("now"), Value::String(node.into()));
+        selected.push(Value::Mapping(sel));
+        changed_index = true;
+    }
     if changed_index {
         let items = mapping(&mut index)?.get_mut(key("items")).and_then(Value::as_sequence_mut).ok_or("订阅列表格式无效")?;
         mapping(&mut items[current_idx])?.insert(key("option"), Value::Mapping(options));
@@ -460,6 +489,11 @@ fn verge_layers(root: &Path, stage: &Path, guards: &mut Vec<Guard>) -> Result<(V
 fn layer_doc(layer: &Layer) -> Result<Value, String> { parse_yaml(&read(&layer.stage)?) }
 fn stage_layer_nodes(layer: &Layer, chain: &[Value]) -> Result<(), String> {
     let mut doc = layer_doc(layer)?;
+    for section in ["prepend", "append"] {
+        if let Some(list) = mapping(&mut doc)?.get_mut(key(section)).and_then(Value::as_sequence_mut) {
+            list.retain(|v| str_field(v, "name").map(|n| !managed(n)).unwrap_or(true));
+        }
+    }
     let existing: HashSet<String> = ["prepend", "append"].iter().flat_map(|k| list(get(&doc, k)).iter())
         .filter_map(|v| str_field(v, "name").map(str::to_owned)).collect();
     let prepend = ensure_list(&mut doc, "prepend")?;
@@ -471,9 +505,14 @@ fn stage_layer_nodes(layer: &Layer, chain: &[Value]) -> Result<(), String> {
 }
 fn set_layer_group(layer: &Layer, exit_name: &str) -> Result<(), String> {
     let mut doc = layer_doc(layer)?;
+    for section in ["prepend", "append"] {
+        if let Some(list) = mapping(&mut doc)?.get_mut(key(section)).and_then(Value::as_sequence_mut) {
+            list.retain(|g| str_field(g, "name") != Some(LEGACY_GROUP));
+        }
+    }
     let count = ["prepend", "append"].iter().flat_map(|k| list(get(&doc, k)).iter())
         .filter(|g| str_field(g, "name") == Some(STATIC_GROUP)).count();
-    if count > 1 { return Err("静态出口策略组重复，请先在 Clash Verge 修复".into()); }
+    if count > 1 { return Err("HopWay 策略组重复，请先在 Clash Verge 修复".into()); }
     let section = if list(get(&doc, "prepend")).iter().any(|g| str_field(g, "name") == Some(STATIC_GROUP)) { "prepend" }
         else if list(get(&doc, "append")).iter().any(|g| str_field(g, "name") == Some(STATIC_GROUP)) { "append" } else { "prepend" };
     let groups = ensure_list(&mut doc, section)?;
@@ -509,7 +548,7 @@ main = function(config, profileName) {
   var blocked = __NAMES__;
   var excluded = __PATTERN__;
   var exit = __EXIT__;
-  var keep = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "静态ISP"];
+  var keep = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "HopWay"];
   var rules = Array.isArray(c.rules) ? c.rules : [];
   c.rules = rules.filter(function(r) {
     return typeof r === "string" && !/^(MATCH|FINAL),/i.test(r.trim());
@@ -518,18 +557,19 @@ main = function(config, profileName) {
     var i = p.length - 1;
     if ((p[i] || "").trim().toLowerCase() === "no-resolve") i--;
     var target = (p[i] || "").trim();
-    if (i >= 0 && target && keep.indexOf(target) < 0) p[i] = "静态ISP";
+    if (i >= 0 && target && keep.indexOf(target) < 0) p[i] = "HopWay";
     return p.join(",");
   });
-  c.rules.push("MATCH,静态ISP");
+  c.rules.push("MATCH,HopWay");
   if (!Array.isArray(c["proxy-groups"])) c["proxy-groups"] = [];
-  var staticGroup = c["proxy-groups"].find(function(g) { return g && g.name === "静态ISP"; });
-  if (!staticGroup) { staticGroup = { name: "静态ISP" }; c["proxy-groups"].push(staticGroup); }
+  c["proxy-groups"] = c["proxy-groups"].filter(function(g) { return !g || g.name !== "静态ISP"; });
+  var staticGroup = c["proxy-groups"].find(function(g) { return g && g.name === "HopWay"; });
+  if (!staticGroup) { staticGroup = { name: "HopWay" }; c["proxy-groups"].push(staticGroup); }
   staticGroup.type = "select";
   staticGroup.proxies = [exit, "DIRECT"];
   ["use", "include-all", "include-all-proxies", "include-all-providers", "filter", "exclude-filter", "exclude-type"].forEach(function(k) { delete staticGroup[k]; });
   (c["proxy-groups"] || []).forEach(function(g) {
-    if (!g || g.name === "静态ISP") return;
+    if (!g || g.name === "HopWay") return;
     if (Array.isArray(g.proxies)) g.proxies = g.proxies.filter(function(n) { return blocked.indexOf(n) < 0; });
     if (g["include-all"] || g["include-all-proxies"] || g["include-all-providers"] || (Array.isArray(g.use) && g.use.length)) {
       var old = g["exclude-filter"];
@@ -547,13 +587,14 @@ main = function(config, profileName) {
 }
 
 fn plan_verge(root: &Path, stage: &Path, runtime: &Value, chain: &[Value], exit_name: &str, guards: &mut Vec<Guard>) -> Result<(Value, Vec<Change>), String> {
-    let (layers, index_change) = verge_layers(root, stage, guards)?;
+    let (layers, index_change) = verge_layers(root, stage, guards, Some((STATIC_GROUP, exit_name)))?;
     run_stage(stage, "repair-verge", exit_name)?;
     let proxies = layers.iter().find(|l| l.kind == "proxies").unwrap();
     stage_layer_nodes(proxies, chain)?;
     run_stage(stage, "sync-verge", exit_name)?;
     set_layer_group(layers.iter().find(|l| l.kind == "groups").unwrap(), exit_name)?;
     let mut candidate = runtime.clone();
+    prune_stale(&mut candidate)?;
     add_nodes(&mut candidate, chain)?;
     set_static_group(&mut candidate, exit_name)?;
     let protected: Vec<String> = list(get(&candidate, "proxies")).iter().filter_map(|p| str_field(p, "name")).filter(|n| managed(n)).map(str::to_owned).collect();
@@ -574,6 +615,9 @@ fn plan_verge(root: &Path, stage: &Path, runtime: &Value, chain: &[Value], exit_
             changes.push(Change { path: layer.path, bytes, existed: layer.original.is_some() });
         }
     }
+    // The merged runtime file is written as well so the kernel can reload it
+    // directly; layers keep the change persistent across future regenerations.
+    changes.push(Change { path: runtime_path(root), bytes: yaml_bytes(&candidate)?, existed: true });
     // The profile index is committed last so newly created layers exist first.
     if let Some(index) = index_change { changes.push(index); }
     Ok((candidate, changes))
@@ -625,6 +669,29 @@ fn prepare_offline_validation(doc: &mut Value, root: &Path, stage: &Path) -> Res
     Ok(())
 }
 
+// Read the registered install location instead of guessing fixed paths, so
+// non-standard install drives are found without hardcoding user directories.
+fn verge_core_from_registry() -> Option<PathBuf> {
+    use winreg::{enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}, RegKey};
+    for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+        for sub in [r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"] {
+            let Ok(uninstall) = RegKey::predef(hive).open_subkey(sub) else { continue };
+            for name in uninstall.enum_keys().flatten() {
+                let Ok(entry) = uninstall.open_subkey(&name) else { continue };
+                let display: String = entry.get_value("DisplayName").unwrap_or_default();
+                if !display.to_lowercase().contains("clash verge") { continue; }
+                for field in ["InstallLocation", "DisplayIcon"] {
+                    let Ok(value) = entry.get_value::<String, _>(field) else { continue };
+                    let path = PathBuf::from(value.trim().trim_matches('"'));
+                    let dir = if path.is_dir() { path } else if path.is_file() { path.parent().map(Path::to_path_buf).unwrap_or_default() } else { continue };
+                    let exe = dir.join("verge-mihomo.exe");
+                    if exe.is_file() { return Some(exe); }
+                }
+            }
+        }
+    }
+    None
+}
 fn find_core() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     for var in ["ProgramFiles", "LOCALAPPDATA"] {
@@ -634,8 +701,7 @@ fn find_core() -> Result<PathBuf, String> {
             else { candidates.push(root.join("Programs").join("Clash Verge").join("verge-mihomo.exe")); }
         }
     }
-    candidates.push(PathBuf::from(r"D:\Program Files\Clash Verge\verge-mihomo.exe"));
-    candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| "没有找到 verge-mihomo 内核，无法安全校验配置".into())
+    candidates.into_iter().find(|p| p.is_file()).or_else(verge_core_from_registry).ok_or_else(|| "没有找到 verge-mihomo 内核，无法安全校验配置".into())
 }
 fn validate_with_core(candidate: &Value, root: &Path, stage: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -687,38 +753,28 @@ fn prepare_visual_for_root(target: &str, visual: super::workspace::VisualChain, 
     let runtime_raw = read(&runtime_path(root))?;
     let runtime = parse_yaml(&runtime_raw)?;
     names_unique(&runtime)?;
+    let count = visual.hops.len();
+    if !(1..=6).contains(&count) { return Err("链路需要 1 至 6 跳".into()); }
     let nonce = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
     let mut nodes = Vec::new();
     let mut previous: Option<String> = None;
     let mut route = Vec::new();
-    for (index, (display, mut node)) in visual.relays.into_iter().enumerate() {
+    let mut exit_name = String::new();
+    for (index, (display, mut node)) in visual.hops.into_iter().enumerate() {
         let display: String = display.chars().take(130).collect();
-        let node_label: String = str_field(&node, "name").ok_or("订阅节点缺少名称")?.chars().take(130).collect();
-        let name = format!("__hopway_{nonce}_r{index}::{node_label}");
+        let node_label: String = str_field(&node, "name").ok_or("节点缺少名称")?.chars().take(130).collect();
+        let name = if index + 1 == count { format!("__hopway_{nonce}_exit::{node_label}") } else { format!("__hopway_{nonce}_h{index}::{node_label}") };
         set_field(&mut node, "name", Value::String(name.clone()))?;
         mapping(&mut node)?.remove(key("dialer-proxy"));
         if let Some(parent) = previous { set_field(&mut node, "dialer-proxy", Value::String(parent))?; }
-        previous = Some(name);
+        previous = Some(name.clone());
+        if index + 1 == count { exit_name = name; }
         nodes.push(node);
         route.push(display);
     }
-    if nodes.is_empty() { return Err("请先连接 VPN 订阅".into()); }
-    let exit_label: String = visual.exit.name.chars().take(130).collect();
-    let exit_name = format!("__hopway_{nonce}_exit::{exit_label}");
-    let mut fields = Mapping::new();
-    fields.insert(key("name"), Value::String(exit_name.clone()));
-    fields.insert(key("type"), Value::String("socks5".into()));
-    fields.insert(key("server"), Value::String(visual.exit.server.clone()));
-    fields.insert(key("port"), Value::Number(visual.exit.port.into()));
-    fields.insert(key("username"), Value::String(visual.exit.username));
-    fields.insert(key("password"), Value::String(visual.exit.password));
-    fields.insert(key("udp"), Value::Bool(false));
-    fields.insert(key("dialer-proxy"), Value::String(previous.ok_or("请先连接 VPN 订阅")?));
-    nodes.push(Value::Mapping(fields));
-    route.push(exit_label);
-    let count = nodes.len() - 1;
-    let probe = Some(ProbePlan { nodes: nodes.clone(), expected_ip: visual.exit.server });
-    prepare_built(target, root, &runtime_raw, &runtime, nodes, route, exit_name, probe, count, visual.unused_count)
+    let probe_ip = nodes.last().and_then(|n| str_field(n, "server")).and_then(|server| server.parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_string());
+    let probe = Some(ProbePlan { nodes: nodes.clone(), expected_ip: probe_ip });
+    prepare_built(target, root, &runtime_raw, &runtime, nodes, route, exit_name, probe, count - 1, visual.unused_count)
 }
 
 fn redacted_script(nodes: &[Value], exit_name: &str) -> Result<String, String> {
@@ -750,14 +806,14 @@ fn prepare_built(target: &str, root: &Path, runtime_raw: &[u8], runtime: &Value,
     if changes.is_empty() { return Err("没有需要写入的配置".into()); }
     validate_with_core(&candidate, root, temp.path())?;
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let mut warnings = vec!["静态出口仅作为策略组候选，需在客户端确认该组已选中它".into()];
-    warnings.push("候选基于当前运行配置校验；写入后需在 Clash Verge 重启内核并复核出口".into());
+    let mut warnings = vec!["链尾将写入 HopWay 组并在应用时自动选中".into()];
+    warnings.push("候选基于当前运行配置校验；写入后自动重载内核，控制器不可用时需手动重启 Clash Verge".into());
     if relay_count > 0 { warnings.push("中继使用当前节点的配置副本；订阅更新后需重新下发".into()); }
     if unused_count > 0 { warnings.push(format!("有 {unused_count} 个未连接模块不会写入此次链路")); }
-    let files = vec!["规则增强".into(), "节点增强".into(), "策略组增强".into(), "扩展脚本".into(), "订阅绑定（如需）".into()];
+    let files = vec!["规则增强".into(), "节点增强".into(), "策略组增强".into(), "扩展脚本".into(), "运行配置".into(), "订阅绑定（如需）".into()];
     let script_preview = redacted_script(&chain, &exit_name)?;
     let preview = PlanPreview { id: id.clone(), target: target.into(), route, exit_node: exit_name.clone(), script_preview, files, warnings };
-    Ok((Prepared { id, target: target.into(), exit_node: exit_name, guards, changes, probe }, preview))
+    Ok((Prepared { id, target: target.into(), root: root.to_path_buf(), exit_node: exit_name, guards, changes, probe }, preview))
 }
 
 fn check_guards(guards: &[Guard]) -> Result<(), String> {
@@ -826,11 +882,13 @@ fn probe_chain(plan: ProbePlan) -> ProbeResult {
     match run_probe_chain(&plan) {
         Ok(values) => {
             let first = values.first().cloned();
-            let normalized = expected.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string()).unwrap_or_else(|| expected.clone());
-            let passed = !values.is_empty() && values.iter().all(|ip| ip == &normalized);
+            let normalized = expected.as_deref().and_then(|e| e.parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_string());
+            let passed = !values.is_empty() && normalized.as_ref().map(|n| values.iter().all(|ip| ip == n)).unwrap_or(true);
             ProbeResult {
                 state: if passed { "ok" } else { "mismatch" }.into(), ip: first, expected_ip: expected,
-                message: if passed { "临时内核出口与静态 IP 一致" } else { "临时内核出口与静态 IP 不一致" }.into(),
+                message: if normalized.is_some() {
+                    if passed { "临时内核出口与期望 IP 一致" } else { "临时内核出口与期望 IP 不一致" }
+                } else { "临时内核出口探测成功" }.into(),
             }
         }
         Err(message) => ProbeResult { state: "failed".into(), ip: None, expected_ip: expected, message: format!("临时内核：{message}") },
@@ -843,7 +901,7 @@ fn run_probe_chain_at(plan: &ProbePlan, probe_url: &str) -> Result<Vec<String>, 
     use std::{net::{IpAddr, TcpListener, TcpStream}, os::windows::process::CommandExt};
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
-    let expected: IpAddr = plan.expected_ip.parse().map_err(|_| "静态出口 IP 无效")?;
+    let expected: Option<IpAddr> = plan.expected_ip.as_deref().map(str::parse).transpose().map_err(|_| "出口 IP 无效")?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| "无法为出口校验分配端口")?;
     let port = listener.local_addr().map_err(|_| "无法为出口校验分配端口")?.port();
     drop(listener);
@@ -933,9 +991,10 @@ pub fn apply(prepared: Prepared, id: &str) -> Result<ApplyResult, String> {
         committed += 1;
     }
     let names = backups.into_iter().flatten().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
-    let next_step = "在 Clash Verge 重启内核，再检查出口。";
+    let activation = super::verge_activate::activate(&runtime_path(&prepared.root), STATIC_GROUP, &prepared.exit_node);
+    let next_step = activation.message.clone();
     let probe = prepared.probe.map(probe_chain);
-    Ok(ApplyResult { target: prepared.target, exit_node: prepared.exit_node, backups: names, next_step: next_step.into(), probe })
+    Ok(ApplyResult { target: prepared.target, exit_node: prepared.exit_node, group: STATIC_GROUP.into(), backups: names, next_step, probe, activation: Some(activation) })
 }
 
 #[cfg(test)]
@@ -1015,11 +1074,11 @@ rules:
         let before = get(&doc, "tun").cloned();
         rewrite_rules(&mut doc).unwrap();
         let rules: Vec<&str> = list(get(&doc, "rules")).iter().filter_map(Value::as_str).collect();
-        assert!(rules.contains(&"DOMAIN-SUFFIX,example.com,静态ISP"));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,example.com,HopWay"));
         assert!(rules.contains(&"DOMAIN-SUFFIX,example.com,DIRECT"));
-        assert!(rules.contains(&"PROCESS-NAME,app.exe,静态ISP"));
+        assert!(rules.contains(&"PROCESS-NAME,app.exe,HopWay"));
         assert!(rules.contains(&"PROCESS-NAME,editor.exe,DIRECT"));
-        assert_eq!(rules.last(), Some(&"MATCH,静态ISP"));
+        assert_eq!(rules.last(), Some(&"MATCH,HopWay"));
         assert_eq!(get(&doc, "tun"), before.as_ref());
     }
     #[test]
@@ -1038,9 +1097,11 @@ rules:
         let script = String::from_utf8(wrap_verge_script(b"function main(c) { return c; }", &[exit.into()], exit).unwrap()).unwrap();
         let harness = format!(r#"{script}
 const c = main({{ rules: ["PROCESS-NAME,app.exe,Airport", "DOMAIN,example.com,DIRECT", "MATCH,Airport"], "proxy-groups": [{{name:"Airport", type:"select", proxies:[{exit_json}, "DIRECT"]}}, {{name:"静态ISP", type:"select", proxies:["OLD"]}}] }});
-if (c.rules.join("|") !== "PROCESS-NAME,app.exe,静态ISP|DOMAIN,example.com,DIRECT|MATCH,静态ISP") process.exit(1);
-if (c["proxy-groups"][1].proxies[0] !== {exit_json}) process.exit(2);
-if (c["proxy-groups"][0].proxies.length !== 1) process.exit(3);
+if (c.rules.join("|") !== "PROCESS-NAME,app.exe,HopWay|DOMAIN,example.com,DIRECT|MATCH,HopWay") process.exit(1);
+if (c["proxy-groups"].some(function(g) {{ return g.name === "静态ISP"; }})) process.exit(2);
+const hopway = c["proxy-groups"].find(function(g) {{ return g.name === "HopWay"; }});
+if (!hopway || hopway.proxies[0] !== {exit_json}) process.exit(3);
+if (c["proxy-groups"][0].proxies.length !== 1) process.exit(4);
 "#, exit_json = serde_json::to_string(exit).unwrap());
         let status = Command::new("node").args(["-e", &harness]).stdout(Stdio::null()).stderr(Stdio::null()).status();
         if let Ok(status) = status { assert!(status.success()); }
@@ -1050,7 +1111,7 @@ if (c["proxy-groups"][0].proxies.length !== 1) process.exit(3);
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("profile.yaml");
         fs::write(&path, b"original").unwrap();
-        let prepared = Prepared { id: "id".into(), target: "verge".into(), exit_node: "exit".into(), guards: vec![Guard { path: path.clone(), hash: Some(hash(b"original")) }], changes: vec![Change { path: path.clone(), bytes: b"new".to_vec(), existed: true }], probe: None };
+        let prepared = Prepared { id: "id".into(), target: "verge".into(), root: temp.path().to_path_buf(), exit_node: "exit".into(), guards: vec![Guard { path: path.clone(), hash: Some(hash(b"original")) }], changes: vec![Change { path: path.clone(), bytes: b"new".to_vec(), existed: true }], probe: None };
         fs::write(&path, b"changed externally").unwrap();
         assert!(apply(prepared, "id").is_err());
         assert_eq!(fs::read(&path).unwrap(), b"changed externally");
@@ -1081,7 +1142,13 @@ if (c["proxy-groups"][0].proxies.length !== 1) process.exit(3);
         assert_eq!(fs::read(&index).unwrap(), before_index);
         let result = apply(prepared, &preview.id).unwrap();
         assert!(result.backups.len() >= 3);
-        assert_eq!(fs::read(&index).unwrap(), before_index);
+        let new_index = parse_yaml(&fs::read(&index).unwrap()).unwrap();
+        // The layer bindings stay put; only the persisted group selection is added.
+        let uids: Vec<&str> = list(get(&new_index, "items")).iter().filter_map(|i| str_field(i, "uid")).collect();
+        assert_eq!(uids, ["P1", "r1", "g1", "p1", "s1"]);
+        let selected = list(get(&list(get(&new_index, "items"))[0], "selected"));
+        assert!(selected.iter().any(|s| str_field(s, "name") == Some(STATIC_GROUP) && str_field(s, "now") == Some(result.exit_node.as_str())));
+        assert!(!before_index.is_empty());
         let script = fs::read_to_string(temp.path().join("profiles").join("s1.js")).unwrap();
         assert!(script.contains("function main(config) { return config; }"));
         assert!(script.contains(WRAPPER_BEGIN));
@@ -1095,8 +1162,11 @@ if (c["proxy-groups"][0].proxies.length !== 1) process.exit(3);
             let path = verge_fixture(temp.path(), true);
             let before = fs::read(&path).unwrap();
             let chain = super::super::workspace::VisualChain {
-                relays: vec![("机场一 · Relay A".into(), named(&source, "proxies", "Relay A").unwrap().clone()), ("机场二 · Relay B".into(), named(&source, "proxies", "Relay B").unwrap().clone())],
-                exit: super::super::workspace::StaticNode { id: "exit-test".into(), name: "静态出口".into(), server: "192.0.2.8".into(), port: 1080, username: "private-user".into(), password: "private-password".into(), position: super::super::workspace::Point { x: 0.0, y: 0.0 } },
+                hops: vec![
+                    ("机场一 · Relay A".into(), named(&source, "proxies", "Relay A").unwrap().clone()),
+                    ("机场二 · Relay B".into(), named(&source, "proxies", "Relay B").unwrap().clone()),
+                    ("静态出口".into(), named(&source, "proxies", "Existing Exit").unwrap().clone()),
+                ],
                 unused_count: 0,
             };
             let (mut prepared, preview) = prepare_visual_for_root(target, chain, temp.path()).unwrap();
@@ -1194,7 +1264,7 @@ if (c["proxy-groups"][0].proxies.length !== 1) process.exit(3);
         });
         let yaml = format!("- name: relay\n  type: socks5\n  server: 127.0.0.1\n  port: {relay_port}\n- name: exit\n  type: socks5\n  server: 127.0.0.1\n  port: {exit_port}\n  username: test-user\n  password: test-password\n  dialer-proxy: relay\n");
         let nodes = serde_yaml::from_str::<Vec<Value>>(&yaml).unwrap();
-        let result = run_probe_chain_at(&ProbePlan { nodes, expected_ip: "127.0.0.1".into() }, &format!("http://127.0.0.1:{http_port}/"));
+        let result = run_probe_chain_at(&ProbePlan { nodes, expected_ip: Some("127.0.0.1".into()) }, &format!("http://127.0.0.1:{http_port}/"));
         relay_stop.store(true, Ordering::Relaxed); exit_stop.store(true, Ordering::Relaxed); http_stop.store(true, Ordering::Relaxed);
         relay_thread.join().unwrap(); exit_thread.join().unwrap(); http_thread.join().unwrap();
         assert_eq!(result.unwrap(), ["127.0.0.1", "127.0.0.1", "127.0.0.1"]);

@@ -1,10 +1,10 @@
 // managed-by: sync-proxy
 // 贴到 Clash Verge：订阅页右键该配置 → 扩展脚本（不是"全局扩展脚本"）
-// 作用：订阅里的分流目标统一改到 静态ISP，末尾补 MATCH，静态ISP 才是真正的默认出口
-// 组名/节点名不同的话，把下面三处 静态ISP / LS-ISP-01 改成你的名字
+// 作用：订阅里的分流目标统一改到 HopWay，末尾补 MATCH，HopWay 才是真正的默认出口
+// 组名/节点名不同的话，把下面三处 HopWay / exit-node 改成你的名字
 function main(config, profileName) {
   if (!Array.isArray(config.rules)) return config;
-  var keep = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "静态ISP"];
+  var keep = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "HopWay"];
 
   function rewrite(rule) {
     var t = rule.trim();
@@ -16,7 +16,7 @@ function main(config, profileName) {
     if ((parts[i] || "").trim().toLowerCase() === "no-resolve") i -= 1;
     var target = (parts[i] || "").trim();
     if (!target || keep.indexOf(target) >= 0) return t;
-    parts[i] = "静态ISP";
+    parts[i] = "HopWay";
     return parts.join(",");
   }
 
@@ -24,16 +24,16 @@ function main(config, profileName) {
     .filter(function (r) { return typeof r === "string"; })
     .map(rewrite)
     .filter(function (r) { return r !== null; });
-  config.rules.push("MATCH,静态ISP");
+  config.rules.push("MATCH,HopWay");
 
-  // 静态节点只能待在 静态ISP 组里；出现在别的组（尤其 url-test）会和中继组成自环
+  // 链尾节点只能待在 HopWay 组里；出现在别的组（尤其 url-test）会和中继组成自环
   (config["proxy-groups"] || []).forEach(function (g) {
-    if (!g || g.name === "静态ISP") return;
+    if (!g || g.name === "HopWay") return;
     if (Array.isArray(g.proxies)) {
-      g.proxies = g.proxies.filter(function (n) { return n !== "LS-ISP-01" && n !== "静态ISP"; });
+      g.proxies = g.proxies.filter(function (n) { return n !== "exit-node" && n !== "HopWay"; });
     }
     if (g["include-all"] || g["include-all-proxies"]) {
-      g["exclude-filter"] = "(?i)(LS-ISP-01|静态ISP)";
+      g["exclude-filter"] = "(?i)(exit-node|HopWay)";
     }
   });
 

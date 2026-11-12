@@ -35,8 +35,8 @@ param(
     [int]$StaticPort = 443,
     [string]$StaticUser,
     [string]$StaticPass,
-    [string]$StaticGroup = '静态ISP',
-    [string]$ProxyName = 'LS-ISP-01',
+    [string]$StaticGroup = 'HopWay',
+    [string]$ProxyName = 'hopway-exit',
 
     # 中继：你自己的机场/代理组名。留空则从现有配置中读取，读不到就报错。
     [string]$RelayGroup,
@@ -390,7 +390,7 @@ function Sync-Verge {
     $canonical = Get-CanonicalRules
 
     # 0) 先验中继组名：写错一个名字，mihomo 会拒绝整份配置（代理页全空）
-    # 静态ISP / LS-ISP-01 不能当自己的中继（会自环），从候选里去掉
+    # 链路组/出口节点不能当自己的中继（会自环），从候选里去掉
     $relayNames = @(Get-RelayCandidates $layers | Where-Object { $_ -ne $StaticGroup -and $_ -ne $ProxyName })
     if ($RelayGroup -and $relayNames.Count -gt 0 -and -not $relayNames.Contains($RelayGroup)) {
         throw ("中继组 '$RelayGroup' 不在订阅里，写进去 Verge 会加载失败（代理页全空）。`n可用的组: " + (($relayNames | Select-Object -First 30) -join ' / '))
@@ -559,12 +559,26 @@ function Get-FlClashProfilePath {
 function Invoke-CoreTest($configPath) {
     $candidates = @()
     if ($CoreExe) { $candidates += $CoreExe }
-    $candidates += @(
-        'C:\Program Files\Clash Verge\verge-mihomo.exe',
-        'D:\Program Files\Clash Verge\verge-mihomo.exe',
-        (Join-Path $env:LOCALAPPDATA 'Programs\Clash Verge\verge-mihomo.exe')
-    )
+    if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles 'Clash Verge\verge-mihomo.exe') }
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Clash Verge\verge-mihomo.exe') }
     $core = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $core) {
+        # Fall back to the registered install location so custom install drives work.
+        $hives = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        foreach ($entry in (Get-ItemProperty $hives -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Clash Verge*' })) {
+            foreach ($field in 'InstallLocation', 'DisplayIcon') {
+                $dir = [string]$entry.$field
+                if (-not $dir) { continue }
+                $dir = $dir.Trim('"')
+                if (Test-Path -LiteralPath $dir -PathType Leaf) { $dir = Split-Path -LiteralPath $dir }
+                $exe = Join-Path $dir 'verge-mihomo.exe'
+                if (Test-Path -LiteralPath $exe) { $core = $exe; break }
+            }
+            if ($core) { break }
+        }
+    }
     if (-not $core) { Say-Warn '没找到 mihomo 内核，跳过语法校验'; return $true }
 
     $tmp = Join-Path $env:TEMP ('sync-proxy-test-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))

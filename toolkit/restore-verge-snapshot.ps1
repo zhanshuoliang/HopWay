@@ -68,5 +68,5 @@ Ok '回滚写入完成'
 Write-Host ''
 Write-Host '下一步：' -ForegroundColor White
 Write-Host '  1) 启动 Clash Verge，在订阅页点一下当前配置卡片，再右键 → 重启内核'
-Write-Host '  2) 核对代理页：静态ISP 组成员是 LS-ISP-01 + DIRECT，且选中的是 LS-ISP-01'
+Write-Host '  2) 核对代理页：HopWay（或旧版 静态ISP）组成员是链尾节点 + DIRECT，且选中的是链尾'
 Write-Host '  3) 跑体检: .\check-egress.ps1 -ProxyPort 7897'
