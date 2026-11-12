@@ -1,0 +1,11 @@
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+app/.hopway-test/
+dist/*.zip
+dist/*.exe
+archive/
+asset-work/
+backups/
+.cargo-home/
